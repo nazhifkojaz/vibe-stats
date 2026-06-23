@@ -13,7 +13,7 @@ import fs from "fs";
 // See sql.js.d.ts for the module declaration backing import("sql.js").
 
 export interface Db {
-  all(sql: string): any[];
+  all(sql: string, params?: any[]): any[];
 }
 
 // Built with `.join` so bundlers / test transformers (esbuild, Vite/vitest)
@@ -39,12 +39,13 @@ export async function openDatabase(filePath: string): Promise<{ db: Db; close: (
   return openWithSqlJs(filePath);
 }
 
-export function queryAll(db: Db, sql: string): any[] {
-  return db.all(sql);
+export function queryAll(db: Db, sql: string, params?: any[]): any[] {
+  return db.all(sql, params);
 }
 
 // Each driver wraps its native handle into the same { db, close } shape.
-function makeDb(all: (sql: string) => any[], close: () => void): { db: Db; close: () => void } {
+// `all` takes optional positional bind params (for `?` placeholders).
+function makeDb(all: (sql: string, params?: any[]) => any[], close: () => void): { db: Db; close: () => void } {
   return { db: { all }, close };
 }
 
@@ -53,7 +54,7 @@ function makeDb(all: (sql: string) => any[], close: () => void): { db: Db; close
 async function openWithBun(filePath: string): Promise<{ db: Db; close: () => void }> {
   const { Database } = await import(/* @vite-ignore */ BUN_SQLITE);
   const d = new Database(filePath, { readonly: true });
-  return makeDb((sql) => d.query(sql).all(), () => d.close());
+  return makeDb((sql, params) => d.query(sql).all(...(params ?? [])), () => d.close());
 }
 
 // ---- Node: node:sqlite (Node >= 22.5) ------------------------------------
@@ -71,7 +72,7 @@ async function tryOpenWithNode(filePath: string): Promise<{ db: Db; close: () =>
 
   try {
     const d = new DatabaseSync(filePath, { readOnly: true });
-    return makeDb((sql) => d.prepare(sql).all(), () => d.close());
+    return makeDb((sql, params) => d.prepare(sql).all(...(params ?? [])), () => d.close());
   } catch {
     return null; // open failed (missing file, read-only media, lock) -> fall back
   }
@@ -123,6 +124,7 @@ interface SqlJsDatabase {
 }
 
 interface SqlJsStatement {
+  bind(values: any[]): boolean;
   step(): boolean;
   getAsObject(): Record<string, any>;
   free(): void;
@@ -168,12 +170,13 @@ export async function openWithSqlJs(filePath: string): Promise<{ db: Db; close: 
   const sql = await getSQL();
   const buffer = await readLargeFile(filePath);
   const raw = new sql.Database(buffer);
-  return makeDb((query) => queryAllSqlJs(raw, query), () => raw.close());
+  return makeDb((query, params) => queryAllSqlJs(raw, query, params), () => raw.close());
 }
 
-function queryAllSqlJs(raw: SqlJsDatabase, sql: string): any[] {
+function queryAllSqlJs(raw: SqlJsDatabase, sql: string, params?: any[]): any[] {
   const stmt = raw.prepare(sql);
   try {
+    if (params && params.length > 0) stmt.bind(params);
     const rows: any[] = [];
     while (stmt.step()) {
       rows.push(stmt.getAsObject());

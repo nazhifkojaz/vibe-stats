@@ -1,8 +1,7 @@
 import os from "os";
 import path from "path";
-import { openDatabase, queryAll } from "./sqlite";
-import type { DailyActivity, ModelActivity, ProjectActivity, HourlyActivity, AgentStats } from "../types";
-import { formatDateLocal } from "../render/format";
+import { openDatabase, queryAll, type Db } from "./sqlite";
+import type { DailyActivity, ModelActivity, ProjectActivity, HourlyActivity, AgentStats, ParseOptions } from "../types";
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), ".local", "share", "opencode", "opencode.db");
 
@@ -19,7 +18,7 @@ interface MessageActivitySummary {
   totalSessions: number;
 }
 
-export async function parse(dbPath?: string, modelFilter?: string): Promise<AgentStats | null> {
+export async function parse(dbPath?: string, modelFilter?: string, options: ParseOptions = {}): Promise<AgentStats | null> {
   const path = dbPath || DEFAULT_DB_PATH;
   try {
     const { db, close } = await openDatabase(path);
@@ -38,10 +37,8 @@ export async function parse(dbPath?: string, modelFilter?: string): Promise<Agen
     let totalSessions = 0;
 
     try {
-      const hasSessionId = hasColumn(db, "message", "session_id");
-
       if (needle) {
-        const fromMessages = readMessageActivity(db, needle, hasSessionId);
+        const fromMessages = readMessageActivity(db, { modelFilter: needle, needSessionCount: true });
         dailyActivity = fromMessages.dailyActivity;
         modelActivity = fromMessages.modelActivity;
         hourlyActivity = fromMessages.hourlyActivity;
@@ -68,22 +65,30 @@ export async function parse(dbPath?: string, modelFilter?: string): Promise<Agen
           totalSessions = fromSessions.totalSessions;
         } catch {}
 
-        try {
-          const fromMessages = readMessageActivity(db, undefined, hasSessionId);
-          modelActivity = fromMessages.modelActivity;
+        // The message scan only feeds `modelActivity` (used by `--by model` and
+        // `--json`) and the input/output/cache split (used by `--json`); it also
+        // serves as the fallback source when the `session` table yields no tokens.
+        // The common heatmap+stats run needs none of that, so skip the full
+        // message-table scan entirely.
+        const needModelDetail = options.by === "model" || options.json === true;
+        if (needModelDetail || totalTokens === 0) {
+          try {
+            const fromMessages = readMessageActivity(db, { needSessionCount: totalTokens === 0 });
+            modelActivity = fromMessages.modelActivity;
 
-          if (totalTokens === 0 && fromMessages.totalTokens > 0) {
-            dailyActivity = fromMessages.dailyActivity;
-            hourlyActivity = fromMessages.hourlyActivity;
-            totalTokens = fromMessages.totalTokens;
-            totalInput = fromMessages.totalInput;
-            totalOutput = fromMessages.totalOutput;
-            totalCache = fromMessages.totalCache;
-            totalCost = fromMessages.totalCost;
-            totalTurns = fromMessages.totalTurns;
-            totalSessions = fromMessages.totalSessions;
-          }
-        } catch {}
+            if (totalTokens === 0 && fromMessages.totalTokens > 0) {
+              dailyActivity = fromMessages.dailyActivity;
+              hourlyActivity = fromMessages.hourlyActivity;
+              totalTokens = fromMessages.totalTokens;
+              totalInput = fromMessages.totalInput;
+              totalOutput = fromMessages.totalOutput;
+              totalCache = fromMessages.totalCache;
+              totalCost = fromMessages.totalCost;
+              totalTurns = fromMessages.totalTurns;
+              totalSessions = fromMessages.totalSessions;
+            }
+          } catch {}
+        }
       }
     } finally {
       close();
@@ -219,94 +224,165 @@ function readSessionActivity(db: any): {
   };
 }
 
-function readMessageActivity(db: any, modelFilter?: string, hasSessionId = false): MessageActivitySummary {
+// Per-row token total: input + output + reasoning + cache.read + cache.write,
+// each missing field coalesced to 0 (mirrors the JS `t.field || 0` reader).
+const MESSAGE_ROW_TOKENS = `(
+        COALESCE(json_extract(data, '$.tokens.input'), 0)
+      + COALESCE(json_extract(data, '$.tokens.output'), 0)
+      + COALESCE(json_extract(data, '$.tokens.reasoning'), 0)
+      + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
+      + COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
+    )`;
+
+// Only assistant rows that actually carry a `tokens` object qualify; the
+// per-row token total is filtered to > 0 separately (matching the JS reader's
+// `if (tokens === 0) continue`).
+const MESSAGE_QUALIFIES = `json_extract(data, '$.role') = 'assistant' AND json_extract(data, '$.tokens') IS NOT NULL`;
+
+interface GroupedMessageRow {
+  date: string | null;
+  hour: number;
+  model: string | null;
+  tokens: number;
+  input: number;
+  output: number;
+  cache: number;
+  cost: number;
+  turns: number;
+}
+
+function readMessageActivity(
+  db: Db,
+  opts: { modelFilter?: string; needSessionCount: boolean }
+): MessageActivitySummary {
   const msgColumns = getTableColumns(db, "message");
   if (msgColumns.length === 0) throw new Error("message table not found");
 
   const hasTimeCreated = msgColumns.includes("time_created");
-  const sessionIdColumn = hasSessionId ? "session_id" : "NULL as session_id";
+  const hasSessionId = msgColumns.includes("session_id");
+
+  // JSON `$.time.created` takes precedence over the `time_created` column
+  // (preserved from the per-row JS reader — see the "prefers JSON time" test).
   const timeExpr = hasTimeCreated
     ? "COALESCE(CAST(json_extract(data, '$.time.created') AS INTEGER), time_created)"
     : "CAST(json_extract(data, '$.time.created') AS INTEGER)";
 
-  const rows = queryAll(db, `
-    SELECT
-      ${timeExpr} as time_ms,
-      data,
-      ${sessionIdColumn}
-    FROM message
-    WHERE data LIKE '%"tokens"%'
-  `) as any[];
+  // Single bound param: a case-insensitive *literal* substring match on modelID,
+  // mirroring JS `model.toLowerCase().includes(needle)`. `instr` is literal, so
+  // any LIKE wildcards in the needle are matched verbatim. A null modelID is
+  // treated as "unknown" so it matches exactly when the JS path would.
+  const needle = opts.modelFilter?.toLowerCase();
+  const params: any[] = [];
+  let modelClause = "";
+  if (needle) {
+    modelClause = "AND instr(lower(COALESCE(json_extract(data, '$.modelID'), 'unknown')), ?) > 0";
+    params.push(needle);
+  }
 
-  const needle = modelFilter?.toLowerCase();
+  // Aggregate entirely in SQLite: json_extract runs in C and we transfer a
+  // compact (date × hour × model) result instead of every raw row + a JS
+  // JSON.parse. The inner subquery materializes per-row date/hour/model/tokens
+  // so the outer query can drop zero-token rows before grouping.
+  //
+  // `WHERE row_tokens > 0 AND date IS NOT NULL`: the first matches the JS
+  // reader's `if (tokens === 0) continue`. The second drops rows with no
+  // resolvable timestamp (neither `time_created` nor `$.time.created`). The old
+  // JS reader bucketed those under `Date.now()` — i.e. "today", which made the
+  // same DB render differently depending on the run date; excluding them is
+  // deterministic. Real OpenCode DBs have none of these rows, and
+  // countMessageSessions applies the identical filter so totals stay consistent.
+  const rows = queryAll(db, `
+    SELECT date, hour, model,
+      SUM(row_tokens) AS tokens,
+      SUM(row_input)  AS input,
+      SUM(row_output) AS output,
+      SUM(row_cache)  AS cache,
+      SUM(row_cost)   AS cost,
+      COUNT(*)        AS turns
+    FROM (
+      SELECT
+        DATE(t / 1000, 'unixepoch', 'localtime') AS date,
+        CAST(STRFTIME('%H', t / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+        json_extract(data, '$.modelID') AS model,
+        ${MESSAGE_ROW_TOKENS} AS row_tokens,
+        COALESCE(json_extract(data, '$.tokens.input'), 0)  AS row_input,
+        COALESCE(json_extract(data, '$.tokens.output'), 0) AS row_output,
+        COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
+          + COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS row_cache,
+        COALESCE(json_extract(data, '$.cost'), 0) AS row_cost
+      FROM (SELECT data, ${timeExpr} AS t FROM message)
+      WHERE ${MESSAGE_QUALIFIES} ${modelClause}
+    )
+    WHERE row_tokens > 0 AND date IS NOT NULL
+    GROUP BY date, hour, model
+  `, params) as GroupedMessageRow[];
+
   const dailyMap = new Map<string, { tokens: number; turns: number; cost: number }>();
   const modelMap = new Map<string, { tokens: number; input: number; output: number; cache: number; cost: number }>();
   const hourlyMap = new Map<number, { tokens: number; turns: number }>();
-  const sessionIds = new Set<string>();
 
   let totalTokens = 0;
   let totalTurns = 0;
 
   for (const row of rows) {
-    try {
-      const d = JSON.parse(row.data);
-      if (d.role !== "assistant" || !d.tokens) continue;
+    const date = String(row.date);
+    const hour = Number(row.hour);
+    const model = row.model || "unknown";
+    const tokens = Number(row.tokens) || 0;
+    const turns = Number(row.turns) || 0;
+    const cost = Number(row.cost) || 0;
 
-      const model = d.modelID || "unknown";
-      if (needle && !model.toLowerCase().includes(needle)) continue;
+    const daily = dailyMap.get(date) || { tokens: 0, turns: 0, cost: 0 };
+    daily.tokens += tokens;
+    daily.turns += turns;
+    daily.cost += cost;
+    dailyMap.set(date, daily);
 
-      const t = d.tokens;
-      const tokens = (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0);
-      if (tokens === 0) continue;
+    const modelEntry = modelMap.get(model) || { tokens: 0, input: 0, output: 0, cache: 0, cost: 0 };
+    modelEntry.tokens += tokens;
+    modelEntry.input += Number(row.input) || 0;
+    modelEntry.output += Number(row.output) || 0;
+    modelEntry.cache += Number(row.cache) || 0;
+    modelEntry.cost += cost;
+    modelMap.set(model, modelEntry);
 
-      const time = normalizeTimestamp(row.time_ms || d.time?.created || Date.now());
-      const date = formatDateLocal(time);
-      const hour = time.getHours();
+    const hourly = hourlyMap.get(hour) || { tokens: 0, turns: 0 };
+    hourly.tokens += tokens;
+    hourly.turns += turns;
+    hourlyMap.set(hour, hourly);
 
-      const daily = dailyMap.get(date) || { tokens: 0, turns: 0, cost: 0 };
-      daily.tokens += tokens;
-      daily.turns += 1;
-      daily.cost += d.cost || 0;
-      dailyMap.set(date, daily);
-
-      const modelEntry = modelMap.get(model) || { tokens: 0, input: 0, output: 0, cache: 0, cost: 0 };
-      modelEntry.tokens += tokens;
-      modelEntry.input += t.input || 0;
-      modelEntry.output += t.output || 0;
-      modelEntry.cache += (t.cache?.read || 0) + (t.cache?.write || 0);
-      modelEntry.cost += d.cost || 0;
-      modelMap.set(model, modelEntry);
-
-      const hourly = hourlyMap.get(hour) || { tokens: 0, turns: 0 };
-      hourly.tokens += tokens;
-      hourly.turns += 1;
-      hourlyMap.set(hour, hourly);
-
-      if (row.session_id !== null && row.session_id !== undefined && row.session_id !== "") {
-        sessionIds.add(String(row.session_id));
-      }
-      totalTokens += tokens;
-      totalTurns += 1;
-    } catch {}
+    totalTokens += tokens;
+    totalTurns += turns;
   }
 
   const dailyActivity = Array.from(dailyMap.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, v]) => ({ date, tokens: v.tokens, turns: v.turns, cost: v.cost }));
 
-  const modelActivity = Array.from(modelMap.entries()).map(([model, v]) => ({
-    model,
-    harness: "opencode" as const,
-    tokens: v.tokens,
-    inputTokens: v.input,
-    outputTokens: v.output,
-    cacheTokens: v.cache,
-    cost: v.cost,
-  }));
+  const modelActivity = Array.from(modelMap.entries())
+    .sort(([, a], [, b]) => b.tokens - a.tokens)
+    .map(([model, v]) => ({
+      model,
+      harness: "opencode" as const,
+      tokens: v.tokens,
+      inputTokens: v.input,
+      outputTokens: v.output,
+      cacheTokens: v.cache,
+      cost: v.cost,
+    }));
 
   const hourlyActivity = Array.from(hourlyMap.entries())
     .sort(([a], [b]) => a - b)
     .map(([hour, v]) => ({ hour, tokens: v.tokens, turns: v.turns }));
+
+  // Distinct session count is needed only when the message scan is the totals
+  // source (`--model` filter or the no-session-tokens fallback); the common
+  // `--by model` / `--json` path keeps the session table's count, so skip the
+  // extra scan there. When skipped, `totalSessions` is a turn-count placeholder
+  // the caller does not read — only consume it when `needSessionCount` was true.
+  const totalSessions = opts.needSessionCount
+    ? countMessageSessions(db, hasSessionId, modelClause, params, timeExpr) || totalTurns
+    : totalTurns;
 
   return {
     dailyActivity,
@@ -318,12 +394,30 @@ function readMessageActivity(db: any, modelFilter?: string, hasSessionId = false
     totalCache: modelActivity.reduce((s, m) => s + m.cacheTokens, 0),
     totalCost: modelActivity.reduce((s, m) => s + m.cost, 0),
     totalTurns,
-    totalSessions: sessionIds.size || totalTurns,
+    totalSessions,
   };
 }
 
-function normalizeTimestamp(value: number): Date {
-  return new Date(value < 1_000_000_000_000 ? value * 1000 : value);
+// COUNT(DISTINCT session_id) over EXACTLY the same qualifying rows the grouped
+// query counts (assistant, has tokens, optional model filter, row_tokens > 0,
+// and a resolvable timestamp), mirroring the JS `sessionIds.size` (non-null,
+// non-empty ids only). The `DATE(...) IS NOT NULL` clause must match the grouped
+// query's `date IS NOT NULL` filter — otherwise a session whose only token rows
+// lack a timestamp would be counted here yet contribute nothing to the token
+// totals. Returns 0 when there is no usable session_id column so the caller
+// falls back to the turn count, matching `sessionIds.size || totalTurns`.
+function countMessageSessions(db: Db, hasSessionId: boolean, modelClause: string, params: any[], timeExpr: string): number {
+  if (!hasSessionId) return 0;
+  const rows = queryAll(db, `
+    SELECT COUNT(DISTINCT session_id) AS sessions
+    FROM (SELECT session_id, data, ${timeExpr} AS t FROM message)
+    WHERE ${MESSAGE_QUALIFIES}
+      AND session_id IS NOT NULL AND session_id <> ''
+      ${modelClause}
+      AND ${MESSAGE_ROW_TOKENS} > 0
+      AND DATE(t / 1000, 'unixepoch', 'localtime') IS NOT NULL
+  `, params) as Array<{ sessions: number }>;
+  return Number(rows[0]?.sessions) || 0;
 }
 
 function getTableColumns(db: any, tableName: string): string[] {
@@ -332,9 +426,4 @@ function getTableColumns(db: any, tableName: string): string[] {
   } catch {
     return [];
   }
-}
-
-function hasColumn(db: any, tableName: string, columnName: string): boolean {
-  const columns = getTableColumns(db, tableName);
-  return columns.includes(columnName);
 }

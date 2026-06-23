@@ -1,6 +1,6 @@
 import os from "os";
 import path from "path";
-import type { AgentStats, HarnessName, CliOptions } from "../types";
+import type { AgentStats, HarnessName, CliOptions, ParseOptions } from "../types";
 import * as opencode from "./opencode";
 import * as claude from "./claude";
 import * as codex from "./codex";
@@ -17,7 +17,7 @@ interface SourceConfig {
   name: HarnessName;
   defaultPaths: string[];
   pathKey: keyof Pick<CliOptions, "db" | "claude" | "codex" | "pi">;
-  parse: (customPath?: string, modelFilter?: string) => Promise<AgentStats | null> | AgentStats | null;
+  parse: (customPath?: string, modelFilter?: string, options?: ParseOptions) => Promise<AgentStats | null> | AgentStats | null;
 }
 
 const SOURCES: SourceConfig[] = [
@@ -105,8 +105,9 @@ export async function collectAll(options: CliOptions = {}): Promise<AgentStats[]
     plannedSources.push({ source, resolvedPath });
   }
 
+  const parseOptions: ParseOptions = { by: options.by, json: options.json };
   const parsed = await Promise.all(
-    plannedSources.map(({ source, resolvedPath }) => source.parse(resolvedPath, options.model))
+    plannedSources.map(({ source, resolvedPath }) => source.parse(resolvedPath, options.model, parseOptions))
   );
 
   const agents: AgentStats[] = [];

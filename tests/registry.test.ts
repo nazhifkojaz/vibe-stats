@@ -119,10 +119,24 @@ describe("collectAll", () => {
     const agents = await collectAll({ model: "sonnet" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["opencode", "claude", "codex", "pi"]);
-    expect(opencodeParse).toHaveBeenCalledWith(path.join(home, ".local/share/opencode/opencode.db"), "sonnet");
-    expect(claudeParse).toHaveBeenCalledWith(path.join(home, ".claude"), "sonnet");
+    expect(opencodeParse).toHaveBeenCalledWith(path.join(home, ".local/share/opencode/opencode.db"), "sonnet", expect.anything());
+    expect(claudeParse).toHaveBeenCalledWith(path.join(home, ".claude"), "sonnet", expect.anything());
     expect(codexParse).toHaveBeenCalledWith(path.join(home, ".codex"), undefined, "sonnet");
-    expect(piParse).toHaveBeenCalledWith(path.join(home, ".pi/agent/sessions"), "sonnet");
+    expect(piParse).toHaveBeenCalledWith(path.join(home, ".pi/agent/sessions"), "sonnet", expect.anything());
+  });
+
+  it("forwards the render options (by/json) to each parser", async () => {
+    const home = makeHome();
+    touch(path.join(home, ".local/share/opencode/opencode.db"));
+
+    const { collectAll } = await importRegistry(home);
+    await collectAll({ agent: "opencode", by: "model", json: true });
+
+    expect(opencodeParse).toHaveBeenCalledWith(
+      path.join(home, ".local/share/opencode/opencode.db"),
+      undefined,
+      { by: "model", json: true }
+    );
   });
 
   it("detects OpenCode under XDG_DATA_HOME", async () => {
@@ -136,7 +150,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "opencode" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["opencode"]);
-    expect(opencodeParse).toHaveBeenCalledWith(dbPath, undefined);
+    expect(opencodeParse).toHaveBeenCalledWith(dbPath, undefined, expect.anything());
   });
 
   it("detects OpenCode in a macOS Application Support location", async () => {
@@ -148,7 +162,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "opencode" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["opencode"]);
-    expect(opencodeParse).toHaveBeenCalledWith(dbPath, undefined);
+    expect(opencodeParse).toHaveBeenCalledWith(dbPath, undefined, expect.anything());
   });
 
   it("detects Codex when only the sessions directory exists", async () => {
@@ -173,7 +187,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "claude" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["claude"]);
-    expect(claudeParse).toHaveBeenCalledWith(claudeRoot, undefined);
+    expect(claudeParse).toHaveBeenCalledWith(claudeRoot, undefined, expect.anything());
   });
 
   it("detects Codex under AppData", async () => {
@@ -201,7 +215,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "pi" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["pi"]);
-    expect(piParse).toHaveBeenCalledWith(sessionsDir, undefined);
+    expect(piParse).toHaveBeenCalledWith(sessionsDir, undefined, expect.anything());
   });
 
   it("detects Pi sessions in a macOS Application Support location", async () => {
@@ -213,7 +227,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "pi" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["pi"]);
-    expect(piParse).toHaveBeenCalledWith(sessionsDir, undefined);
+    expect(piParse).toHaveBeenCalledWith(sessionsDir, undefined, expect.anything());
   });
 
   it("skips parsers when default locations are missing", async () => {
@@ -237,8 +251,8 @@ describe("collectAll", () => {
     });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["claude", "pi"]);
-    expect(claudeParse).toHaveBeenCalledWith("/custom/claude/projects", "opus");
-    expect(piParse).toHaveBeenCalledWith("/custom/pi/sessions", "opus");
+    expect(claudeParse).toHaveBeenCalledWith("/custom/claude/projects", "opus", expect.anything());
+    expect(piParse).toHaveBeenCalledWith("/custom/pi/sessions", "opus", expect.anything());
     expect(opencodeParse).not.toHaveBeenCalled();
     expect(codexParse).not.toHaveBeenCalled();
   });
@@ -291,6 +305,6 @@ describe("collectAll", () => {
     const agents = await collectAll2({ agent: "claude" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["claude"]);
-    expect(claudeParse).toHaveBeenCalledWith(claudeDir, undefined);
+    expect(claudeParse).toHaveBeenCalledWith(claudeDir, undefined, expect.anything());
   });
 });

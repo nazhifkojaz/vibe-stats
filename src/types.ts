@@ -80,3 +80,11 @@ export interface CliOptions {
   codex?: string;
   pi?: string;
 }
+
+// Subset of CliOptions passed to source parsers so they can skip work whose
+// output is not requested (e.g. OpenCode's per-message model breakdown, which
+// only `--by model` and `--json` consume).
+export interface ParseOptions {
+  by?: CliOptions["by"];
+  json?: boolean;
+}

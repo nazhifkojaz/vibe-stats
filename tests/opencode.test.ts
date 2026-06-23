@@ -308,8 +308,8 @@ describe("opencode.parse", () => {
     expect(stats!.activeDays).toBe(1);
   });
 
-  it("uses session table when both session and message tables exist", async () => {
-    const dbPath = await createTestDb((db) => {
+  async function writeSessionAndMessageDb(): Promise<string> {
+    return createTestDb((db) => {
       db.run(`
         CREATE TABLE session (
           time_created INTEGER NOT NULL,
@@ -346,15 +346,158 @@ describe("opencode.parse", () => {
         ]
       );
     });
+  }
 
-    const stats = await parse(dbPath);
+  it("uses session table (and skips the message scan) in default mode", async () => {
+    const stats = await parse(await writeSessionAndMessageDb());
 
     expect(stats).not.toBeNull();
     expect(stats!.totalTokens).toBe(700);
     expect(stats!.totalInputTokens).toBe(500);
     expect(stats!.totalOutputTokens).toBe(200);
+    // The default heatmap+stats run never renders modelActivity, so the message
+    // table is not scanned and the per-model breakdown stays empty.
+    expect(stats!.modelActivity).toEqual([]);
+  });
+
+  it("scans messages for the per-model breakdown only when --by model is requested", async () => {
+    const stats = await parse(await writeSessionAndMessageDb(), undefined, { by: "model" });
+
+    expect(stats).not.toBeNull();
+    // Totals still come from the session table...
+    expect(stats!.totalTokens).toBe(700);
+    expect(stats!.totalInputTokens).toBe(500);
+    // ...but the model breakdown is now populated from the message scan.
     expect(stats!.modelActivity).toHaveLength(1);
-    expect(stats!.modelActivity[0].model).toBe("gpt-5");
+    expect(stats!.modelActivity[0]).toMatchObject({ model: "gpt-5", tokens: 200 });
+  });
+
+  it("scans messages for the input/output/cache split when --json is requested", async () => {
+    const stats = await parse(await writeSessionAndMessageDb(), undefined, { json: true });
+
+    expect(stats).not.toBeNull();
+    expect(stats!.totalTokens).toBe(700);
+    expect(stats!.modelActivity).toHaveLength(1);
+    expect(stats!.modelActivity[0]).toMatchObject({
+      model: "gpt-5",
+      tokens: 200,
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheTokens: 25,
+    });
+  });
+
+  it("aggregates message rows across days, hours, models, and sessions in SQL", async () => {
+    const dbPath = await createTestDb((db) => {
+      db.run(`
+        CREATE TABLE message (
+          time_created INTEGER NOT NULL,
+          session_id TEXT,
+          data TEXT NOT NULL
+        );
+      `);
+
+      const insert = (time: number, session: string, data: object) =>
+        db.run("INSERT INTO message (time_created, session_id, data) VALUES (?, ?, ?)", [
+          time,
+          session,
+          JSON.stringify(data),
+        ]);
+
+      // Two rows that share date/hour/model/session collapse into one group.
+      insert(new Date(2026, 5, 1, 10, 5).getTime(), "session-a", {
+        role: "assistant",
+        modelID: "gpt-5",
+        cost: 0.1,
+        tokens: { input: 100, output: 50 },
+      });
+      insert(new Date(2026, 5, 1, 10, 40).getTime(), "session-a", {
+        role: "assistant",
+        modelID: "gpt-5",
+        cost: 0.05,
+        tokens: { input: 10, output: 5 },
+      });
+      // A different day, hour, model, and session.
+      insert(new Date(2026, 5, 2, 14, 0).getTime(), "session-b", {
+        role: "assistant",
+        modelID: "claude-sonnet",
+        cost: 0.2,
+        tokens: { input: 200, output: 100 },
+      });
+    });
+
+    const stats = await parse(dbPath);
+
+    expect(stats).not.toBeNull();
+    expect(stats).toMatchObject({
+      totalTokens: 465,
+      totalInputTokens: 310,
+      totalOutputTokens: 155,
+      totalCacheTokens: 0,
+      totalTurns: 3,
+      totalSessions: 2,
+      activeDays: 2,
+      dailyActivity: [
+        { date: "2026-06-01", tokens: 165, turns: 2 },
+        { date: "2026-06-02", tokens: 300, turns: 1 },
+      ],
+      hourlyActivity: [
+        { hour: 10, tokens: 165, turns: 2 },
+        { hour: 14, tokens: 300, turns: 1 },
+      ],
+    });
+    expect(stats!.totalCost).toBeCloseTo(0.35);
+    expect(stats!.modelActivity).toEqual(expect.arrayContaining([
+      { model: "gpt-5", harness: "opencode", tokens: 165, inputTokens: 110, outputTokens: 55, cacheTokens: 0, cost: expect.closeTo(0.15) },
+      { model: "claude-sonnet", harness: "opencode", tokens: 300, inputTokens: 200, outputTokens: 100, cacheTokens: 0, cost: 0.2 },
+    ]));
+  });
+
+  it("excludes assistant rows with no resolvable timestamp from both tokens and session count", async () => {
+    const dbPath = await createTestDb((db) => {
+      // time_created is nullable here so we can store a row with no timestamp at all.
+      db.run(`
+        CREATE TABLE message (
+          time_created INTEGER,
+          session_id TEXT,
+          data TEXT NOT NULL
+        );
+      `);
+
+      db.run(
+        "INSERT INTO message (time_created, session_id, data) VALUES (?, ?, ?)",
+        [
+          new Date(2026, 5, 1, 10, 0).getTime(),
+          "session-timed",
+          JSON.stringify({ role: "assistant", modelID: "gpt-5", tokens: { input: 100, output: 50 } }),
+        ]
+      );
+      // No time_created value AND no $.time.created → unresolvable timestamp. The old
+      // JS reader dated this to "today"; the SQL path drops it deterministically, and
+      // must drop it from the session count too (else totalSessions would disagree
+      // with the token totals).
+      db.run(
+        "INSERT INTO message (time_created, session_id, data) VALUES (?, ?, ?)",
+        [
+          null,
+          "session-untimed",
+          JSON.stringify({ role: "assistant", modelID: "gpt-5", tokens: { input: 9999, output: 9999 } }),
+        ]
+      );
+    });
+
+    const stats = await parse(dbPath);
+
+    expect(stats).not.toBeNull();
+    // Only the timed row contributes tokens/turns...
+    expect(stats!.totalTokens).toBe(150);
+    expect(stats!.totalTurns).toBe(1);
+    // ...and only its session is counted (session-untimed is excluded, so totalSessions
+    // stays consistent with the token totals).
+    expect(stats!.totalSessions).toBe(1);
+    expect(stats!.dailyActivity).toEqual([
+      { date: "2026-06-01", tokens: 150, turns: 1, cost: 0 },
+    ]);
   });
 
   it("correctly identifies bestDay across multiple days", async () => {
