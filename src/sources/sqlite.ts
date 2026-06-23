@@ -1,14 +1,128 @@
 import fs from "fs";
 
-// Inline interfaces for the exported API types.
-// See sql.js.d.ts for the matching module declaration needed by import("sql.js").
+// SQLite driver abstraction.
+//
+// Callers go through `openDatabase` + `queryAll` only. We prefer a native,
+// path-based driver — Bun's `bun:sqlite` or Node's built-in `node:sqlite`
+// (Node >= 22.5) — which open the file by path and read only the pages a
+// query touches (and apply the WAL). On a multi-GB OpenCode DB that is tens
+// of MB instead of the whole file. We fall back to `sql.js` (pure-WASM,
+// whole-file-in-memory) so the tool still runs where no native driver exists
+// (Node < 22.5, Deno) or a read-only open fails (read-only media, locked DB).
+//
+// See sql.js.d.ts for the module declaration backing import("sql.js").
+
+export interface Db {
+  all(sql: string): any[];
+}
+
+// Built with `.join` so bundlers / test transformers (esbuild, Vite/vitest)
+// cannot statically resolve these runtime-only specifiers: `bun:sqlite` only
+// exists in the Bun runtime, `node:sqlite` only in Node >= 22.5. Paired with
+// `@vite-ignore` on the dynamic imports below.
+const BUN_SQLITE = ["bun", "sqlite"].join(":");
+const NODE_SQLITE = ["node", "sqlite"].join(":");
+
+export async function openDatabase(filePath: string): Promise<{ db: Db; close: () => void }> {
+  if (process.env.VOM_SQLITE_DRIVER !== "sqljs") {
+    if (typeof (globalThis as any).Bun !== "undefined") {
+      try {
+        return await openWithBun(filePath);
+      } catch {
+        // Bun present but the open failed (e.g. read-only media) -> fall back.
+      }
+    } else {
+      const native = await tryOpenWithNode(filePath);
+      if (native) return native;
+    }
+  }
+  return openWithSqlJs(filePath);
+}
+
+export function queryAll(db: Db, sql: string): any[] {
+  return db.all(sql);
+}
+
+// Each driver wraps its native handle into the same { db, close } shape.
+function makeDb(all: (sql: string) => any[], close: () => void): { db: Db; close: () => void } {
+  return { db: { all }, close };
+}
+
+// ---- Bun: bun:sqlite -----------------------------------------------------
+
+async function openWithBun(filePath: string): Promise<{ db: Db; close: () => void }> {
+  const { Database } = await import(/* @vite-ignore */ BUN_SQLITE);
+  const d = new Database(filePath, { readonly: true });
+  return makeDb((sql) => d.query(sql).all(), () => d.close());
+}
+
+// ---- Node: node:sqlite (Node >= 22.5) ------------------------------------
+
+async function tryOpenWithNode(filePath: string): Promise<{ db: Db; close: () => void } | null> {
+  let DatabaseSync: any;
+  const restoreWarnings = silenceSqliteExperimentalWarning();
+  try {
+    ({ DatabaseSync } = await import(/* @vite-ignore */ NODE_SQLITE));
+  } catch {
+    return null; // node:sqlite unavailable (Node < 22.5, Deno, ...) -> next driver
+  } finally {
+    restoreWarnings();
+  }
+
+  try {
+    const d = new DatabaseSync(filePath, { readOnly: true });
+    return makeDb((sql) => d.prepare(sql).all(), () => d.close());
+  } catch {
+    return null; // open failed (missing file, read-only media, lock) -> fall back
+  }
+}
+
+// node:sqlite emits `ExperimentalWarning: SQLite is an experimental feature`
+// on first import. A `process.on('warning')` listener cannot suppress the
+// default stderr print, so we filter `process.emitWarning` (which is called
+// synchronously during the import) and restore it once the last open is done.
+//
+// Reference-counted: `collectAll` opens the OpenCode and Codex DBs concurrently
+// (registry.ts), so two `tryOpenWithNode` calls interleave around the
+// `await import`. A naive per-call save/restore would capture an already-patched
+// function and leave a wrapper installed on the global forever; the counter
+// ensures exactly one patch is installed and the original is restored only when
+// the final concurrent open releases it.
+let emitWarningDepth = 0;
+let nativeEmitWarning: typeof process.emitWarning | null = null;
+
+function silenceSqliteExperimentalWarning(): () => void {
+  if (emitWarningDepth++ === 0) {
+    const original = (nativeEmitWarning = process.emitWarning);
+    process.emitWarning = function (warning: any, ...rest: any[]): void {
+      const type = typeof rest[0] === "string" ? rest[0] : rest[0]?.type;
+      const message = typeof warning === "string" ? warning : warning?.message;
+      if (type === "ExperimentalWarning" && typeof message === "string" && message.includes("SQLite")) {
+        return;
+      }
+      (original as any).apply(process, [warning, ...rest]);
+    } as typeof process.emitWarning;
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--emitWarningDepth === 0 && nativeEmitWarning) {
+      process.emitWarning = nativeEmitWarning;
+      nativeEmitWarning = null;
+    }
+  };
+}
+
+// ---- Fallback: sql.js (pure WASM, whole file in memory) ------------------
+
 interface SqlJsDatabase {
   prepare(sql: string): SqlJsStatement;
   close(): void;
 }
 
 interface SqlJsStatement {
-  bind(params: any[]): boolean;
   step(): boolean;
   getAsObject(): Record<string, any>;
   free(): void;
@@ -17,8 +131,6 @@ interface SqlJsStatement {
 interface SqlJsStatic {
   Database: new (data: ArrayLike<number | bigint>) => SqlJsDatabase;
 }
-
-type SqlValue = number | string | null;
 
 let SQL: SqlJsStatic | null = null;
 let SQL_PROMISE: Promise<SqlJsStatic> | null = null;
@@ -52,20 +164,16 @@ async function readLargeFile(filePath: string): Promise<Buffer> {
   return Buffer.concat(chunks, size);
 }
 
-export async function openDatabase(filePath: string): Promise<{ db: SqlJsDatabase; close: () => void }> {
-  const SQL = await getSQL();
+export async function openWithSqlJs(filePath: string): Promise<{ db: Db; close: () => void }> {
+  const sql = await getSQL();
   const buffer = await readLargeFile(filePath);
-  const db = new SQL.Database(buffer);
-  return {
-    db,
-    close: () => db.close(),
-  };
+  const raw = new sql.Database(buffer);
+  return makeDb((query) => queryAllSqlJs(raw, query), () => raw.close());
 }
 
-export function queryAll(db: SqlJsDatabase, sql: string, params: SqlValue[] = []): any[] {
-  const stmt = db.prepare(sql);
+function queryAllSqlJs(raw: SqlJsDatabase, sql: string): any[] {
+  const stmt = raw.prepare(sql);
   try {
-    if (params.length > 0) stmt.bind(params);
     const rows: any[] = [];
     while (stmt.step()) {
       rows.push(stmt.getAsObject());
