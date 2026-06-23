@@ -121,7 +121,7 @@ describe("collectAll", () => {
     expect(agents.map((agent) => agent.harness)).toEqual(["opencode", "claude", "codex", "pi"]);
     expect(opencodeParse).toHaveBeenCalledWith(path.join(home, ".local/share/opencode/opencode.db"), "sonnet", expect.anything());
     expect(claudeParse).toHaveBeenCalledWith(path.join(home, ".claude"), "sonnet", expect.anything());
-    expect(codexParse).toHaveBeenCalledWith(path.join(home, ".codex"), undefined, "sonnet");
+    expect(codexParse).toHaveBeenCalledWith(path.join(home, ".codex"), undefined, "sonnet", expect.anything());
     expect(piParse).toHaveBeenCalledWith(path.join(home, ".pi/agent/sessions"), "sonnet", expect.anything());
   });
 
@@ -173,7 +173,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "codex" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["codex"]);
-    expect(codexParse).toHaveBeenCalledWith(path.join(home, ".codex"), undefined, undefined);
+    expect(codexParse).toHaveBeenCalledWith(path.join(home, ".codex"), undefined, undefined, expect.anything());
   });
 
   it("detects Claude under XDG_CONFIG_HOME", async () => {
@@ -201,7 +201,7 @@ describe("collectAll", () => {
     const agents = await collectAll({ agent: "codex" });
 
     expect(agents.map((agent) => agent.harness)).toEqual(["codex"]);
-    expect(codexParse).toHaveBeenCalledWith(codexRoot, undefined, undefined);
+    expect(codexParse).toHaveBeenCalledWith(codexRoot, undefined, undefined, expect.anything());
   });
 
   it("detects Pi sessions under XDG_DATA_HOME", async () => {

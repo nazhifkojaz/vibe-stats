@@ -60,7 +60,7 @@ const SOURCES: SourceConfig[] = [
       APPDATA ? path.join(APPDATA, "codex") : "",
     ]),
     pathKey: "codex",
-    parse: (customPath?: string, modelFilter?: string) => codex.parse(customPath, undefined, modelFilter),
+    parse: (customPath?: string, modelFilter?: string, options?: ParseOptions) => codex.parse(customPath, undefined, modelFilter, options),
   },
   {
     name: "pi",

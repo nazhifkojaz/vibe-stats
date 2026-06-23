@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import initSqlJs from "sql.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse } from "../src/sources/codex";
 
 const tempDirs: string[] = [];
@@ -293,9 +293,52 @@ describe("codex.parse", () => {
     });
   });
 
-  it("uses DB rollout_path for detailed totals and tokens_used when a rollout is missing", async () => {
+  it("uses DB tokens_used for totals and reads no rollout files in default mode", async () => {
     const root = await writeCodexDbWithRolloutFixture();
+    const readSpy = vi.spyOn(fs, "readFileSync");
     const stats = await parse(root);
+    const readCalls = readSpy.mock.calls.length;
+    readSpy.mockRestore();
+
+    expect(stats).not.toBeNull();
+    // Totals come straight from the DB `tokens_used` counter (150 + 75); the
+    // heatmap/stats numbers are identical to --json because tokens_used matches
+    // the rollout's total here.
+    expect(stats).toMatchObject({
+      sourcePath: root,
+      totalTokens: 225,
+      totalTurns: 2,
+      totalSessions: 2,
+      dailyActivity: [
+        { date: "2026-06-03", tokens: 225, turns: 2, cost: 0 },
+      ],
+      projectActivity: [
+        { project: "/home/alice/db-app", harness: "codex", tokens: 225 },
+      ],
+      hourlyActivity: [
+        { hour: 10, tokens: 150, turns: 1 },
+        { hour: 11, tokens: 75, turns: 1 },
+      ],
+    });
+    // The input/output/cache split is only read from rollouts under --json, so
+    // default mode leaves it zero and never opens a rollout file.
+    expect(stats).toMatchObject({
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheTokens: 0,
+      modelActivity: [
+        { model: "gpt-5.5", harness: "codex", tokens: 225, inputTokens: 0, outputTokens: 0, cacheTokens: 0, cost: 0 },
+      ],
+    });
+    expect(readCalls).toBe(0);
+  });
+
+  it("reads rollouts for the input/output/cache split when --json is requested", async () => {
+    const root = await writeCodexDbWithRolloutFixture();
+    const readSpy = vi.spyOn(fs, "readFileSync");
+    const stats = await parse(root, undefined, undefined, { json: true });
+    const readCalls = readSpy.mock.calls.length;
+    readSpy.mockRestore();
 
     expect(stats).not.toBeNull();
     expect(stats).toMatchObject({
@@ -320,10 +363,12 @@ describe("codex.parse", () => {
         { hour: 11, tokens: 75, turns: 1 },
       ],
     });
+    // --json resolves and parses the rollout JSONL to recover the split.
+    expect(readCalls).toBeGreaterThan(0);
   });
 
-  it("supports older state DBs without rollout_path by scanning session filenames", async () => {
-    const stats = await parse(await writeLegacyCodexDbFixture());
+  it("scans session filenames to resolve the split for older state DBs without rollout_path under --json", async () => {
+    const stats = await parse(await writeLegacyCodexDbFixture(), undefined, undefined, { json: true });
 
     expect(stats).not.toBeNull();
     expect(stats).toMatchObject({

@@ -2,7 +2,7 @@ import { openDatabase, queryAll } from "./sqlite";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import type { DailyActivity, ModelActivity, ProjectActivity, HourlyActivity, AgentStats } from "../types";
+import type { DailyActivity, ModelActivity, ProjectActivity, HourlyActivity, AgentStats, ParseOptions } from "../types";
 import { formatDateLocal } from "../render/format";
 import { collectJsonlFiles } from "./files";
 
@@ -34,6 +34,23 @@ function findRolloutForThread(rolloutFiles: string[], threadId: string): string 
   return rolloutFiles.find((file) => path.basename(file).includes(threadId)) || null;
 }
 
+// Real Codex rollout filenames embed the thread UUID
+// (`rollout-<timestamp>-<uuid>.jsonl`), so index the files by that UUID once and
+// resolve a rollout-less thread in O(1) instead of re-scanning every file per
+// thread (the old O(threads × files)). Filenames without a UUID (e.g. the test
+// fixtures) are left unindexed and fall through to the original substring scan,
+// so the matching semantics are unchanged.
+const ROLLOUT_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+function buildRolloutIndex(rolloutFiles: string[]): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const file of rolloutFiles) {
+    const match = ROLLOUT_UUID_RE.exec(path.basename(file));
+    if (match && !index.has(match[0])) index.set(match[0], file);
+  }
+  return index;
+}
+
 function resolveRolloutPath(
   sessionsDir: string,
   thread: { id: string; rollout_path?: string | null },
@@ -51,7 +68,7 @@ function resolveRolloutPath(
   return findByThreadId(thread.id);
 }
 
-export async function parse(dbPath?: string, sessionsDir?: string, modelFilter?: string): Promise<AgentStats | null> {
+export async function parse(dbPath?: string, sessionsDir?: string, modelFilter?: string, options: ParseOptions = {}): Promise<AgentStats | null> {
   const paths = resolveCodexPaths(dbPath, sessionsDir);
   const dbFile = paths.dbFile;
   const sessDir = paths.sessionsDir;
@@ -92,10 +109,19 @@ export async function parse(dbPath?: string, sessionsDir?: string, modelFilter?:
     let totalCache = 0;
     let totalSessions = 0;
     let rolloutFiles: string[] | null = null;
+    let rolloutIndex: Map<string, string> | null = null;
     const findByThreadId = (threadId: string): string | null => {
       rolloutFiles ??= collectJsonlFiles(sessDir);
-      return findRolloutForThread(rolloutFiles, threadId);
+      rolloutIndex ??= buildRolloutIndex(rolloutFiles);
+      return rolloutIndex.get(threadId) ?? findRolloutForThread(rolloutFiles, threadId);
     };
+
+    // The per-thread input/output/cache split lives only in the rollout JSONL
+    // files and is surfaced only by `--json`. The default heatmap+stats run and
+    // `--by model` need just the per-thread token total, which the DB already
+    // stores as `tokens_used` (model/project/time are on the thread row too), so
+    // they read zero rollout files. Only `--json` resolves and parses rollouts.
+    const needSplit = options.json === true;
 
     for (const thread of threads) {
       if (!thread.updated_at_ms) continue;
@@ -103,24 +129,20 @@ export async function parse(dbPath?: string, sessionsDir?: string, modelFilter?:
       const threadModel = (thread.model || "unknown").toLowerCase();
       if (needle && !threadModel.includes(needle)) continue;
 
-      const rolloutPath = resolveRolloutPath(sessDir, thread, findByThreadId);
-      let tokens: number;
+      let tokens = thread.tokens_used || 0;
       let inputTokens = 0;
       let outputTokens = 0;
       let cacheTokens = 0;
 
-      if (rolloutPath) {
-        const usage = readRolloutUsage(rolloutPath);
+      if (needSplit) {
+        const rolloutPath = resolveRolloutPath(sessDir, thread, findByThreadId);
+        const usage = rolloutPath ? readRolloutUsage(rolloutPath) : null;
         if (usage && usage.totalTokens > 0) {
           tokens = usage.totalTokens;
           inputTokens = usage.inputTokens;
           outputTokens = usage.outputTokens;
           cacheTokens = usage.cachedTokens;
-        } else {
-          tokens = thread.tokens_used || 0;
         }
-      } else {
-        tokens = thread.tokens_used || 0;
       }
 
       if (tokens === 0) continue;
