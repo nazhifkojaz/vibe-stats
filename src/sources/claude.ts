@@ -42,6 +42,7 @@ interface ClaudeStatsCache {
 
 interface ClaudeProjectLine {
   type?: string;
+  uuid?: string;
   timestamp?: string;
   cwd?: string;
   sessionId?: string;
@@ -101,7 +102,118 @@ function parseDirectory(targetPath: string, modelFilter?: string): AgentStats | 
   if (!cacheStats) return jsonlStats;
   if (!jsonlStats) return cacheStats;
 
-  return jsonlStats.totalTokens >= cacheStats.totalTokens ? jsonlStats : cacheStats;
+  return mergeClaudeStats(cacheStats, jsonlStats);
+}
+
+// Claude Code stopped updating stats-cache.json: recent usage now lives only in
+// the per-session JSONL transcripts, while the cache retains older history that
+// Claude has since pruned from disk. Picking one source by total tokens hid all
+// recent activity behind the frozen (but larger, cumulative) cache. Instead,
+// merge by date — JSONL wins for any date it covers, the cache fills in the
+// older dates it alone still has.
+function mergeClaudeStats(cacheStats: AgentStats, jsonlStats: AgentStats): AgentStats {
+  const jsonlDates = new Set(jsonlStats.dailyActivity.map((d) => d.date));
+  const cacheOnlyDaily = cacheStats.dailyActivity.filter((d) => !jsonlDates.has(d.date));
+
+  // The cache's model/cost/session aggregates are lifetime totals with no
+  // per-date breakdown, so scale them by the share of cache tokens that survive
+  // the date merge. Dates now owned by JSONL drop out; with no overlap this is 1.
+  const cacheTotalDaily = cacheStats.dailyActivity.reduce((s, d) => s + d.tokens, 0);
+  const cacheKeptDaily = cacheOnlyDaily.reduce((s, d) => s + d.tokens, 0);
+  const cacheFraction = cacheTotalDaily > 0 ? cacheKeptDaily / cacheTotalDaily : 0;
+
+  const dailyActivity: DailyActivity[] = [...jsonlStats.dailyActivity, ...cacheOnlyDaily].sort(
+    (a, b) => a.date.localeCompare(b.date)
+  );
+
+  const modelMap = new Map<string, ModelActivity>();
+  for (const m of jsonlStats.modelActivity) {
+    modelMap.set(m.model, { ...m });
+  }
+  if (cacheFraction > 0) {
+    for (const m of cacheStats.modelActivity) {
+      const existing = modelMap.get(m.model);
+      if (existing) {
+        existing.tokens += m.tokens * cacheFraction;
+        existing.inputTokens += m.inputTokens * cacheFraction;
+        existing.outputTokens += m.outputTokens * cacheFraction;
+        existing.cacheTokens += m.cacheTokens * cacheFraction;
+        existing.cost += m.cost * cacheFraction;
+      } else {
+        modelMap.set(m.model, {
+          model: m.model,
+          harness: "claude",
+          tokens: m.tokens * cacheFraction,
+          inputTokens: m.inputTokens * cacheFraction,
+          outputTokens: m.outputTokens * cacheFraction,
+          cacheTokens: m.cacheTokens * cacheFraction,
+          cost: m.cost * cacheFraction,
+        });
+      }
+    }
+  }
+  const modelActivity: ModelActivity[] = Array.from(modelMap.values())
+    .map((m) => ({
+      ...m,
+      tokens: Math.round(m.tokens),
+      inputTokens: Math.round(m.inputTokens),
+      outputTokens: Math.round(m.outputTokens),
+      cacheTokens: Math.round(m.cacheTokens),
+    }))
+    .sort((a, b) => b.tokens - a.tokens);
+
+  const hourMap = new Map<number, HourlyActivity>();
+  for (const h of jsonlStats.hourlyActivity) {
+    hourMap.set(h.hour, { ...h });
+  }
+  if (cacheFraction > 0) {
+    for (const h of cacheStats.hourlyActivity) {
+      const existing = hourMap.get(h.hour);
+      if (existing) {
+        existing.tokens += Math.round(h.tokens * cacheFraction);
+        existing.turns += Math.round(h.turns * cacheFraction);
+      } else {
+        hourMap.set(h.hour, {
+          hour: h.hour,
+          tokens: Math.round(h.tokens * cacheFraction),
+          turns: Math.round(h.turns * cacheFraction),
+        });
+      }
+    }
+  }
+  const hourlyActivity: HourlyActivity[] = Array.from(hourMap.values()).sort((a, b) => a.hour - b.hour);
+
+  const cacheKeptTurns = cacheOnlyDaily.reduce((s, d) => s + d.turns, 0);
+  const bestDay = dailyActivity.reduce(
+    (best, d) => (d.tokens > best.tokens ? d : best),
+    { date: "", tokens: 0 }
+  );
+
+  // Derive aggregate token totals from the (already rounded) model breakdown so
+  // the header always matches `--by model` exactly, rather than rounding twice.
+  const totalTokens = modelActivity.reduce((s, m) => s + m.tokens, 0);
+
+  return {
+    harness: "claude",
+    // JSONL is the live source; the cache only backfills pruned older dates.
+    sourcePath: jsonlStats.sourcePath,
+    totalTokens,
+    totalInputTokens: modelActivity.reduce((s, m) => s + m.inputTokens, 0),
+    totalOutputTokens: modelActivity.reduce((s, m) => s + m.outputTokens, 0),
+    totalCacheTokens: modelActivity.reduce((s, m) => s + m.cacheTokens, 0),
+    totalCost: jsonlStats.totalCost + cacheStats.totalCost * cacheFraction,
+    totalTurns: jsonlStats.totalTurns + cacheKeptTurns,
+    totalSessions: jsonlStats.totalSessions + Math.round(cacheStats.totalSessions * cacheFraction),
+    activeDays: dailyActivity.length,
+    currentStreak: 0,
+    longestStreak: 0,
+    bestDay: { date: bestDay.date, tokens: bestDay.tokens },
+    dailyActivity,
+    modelActivity,
+    // The cache carries no project breakdown, so projects reflect JSONL only.
+    projectActivity: jsonlStats.projectActivity,
+    hourlyActivity,
+  };
 }
 
 function parseStatsCache(filePath: string, modelFilter?: string): AgentStats | null {
@@ -231,6 +343,10 @@ function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats
   const projectMap = new Map<string, number>();
   const hourlyMap = new Map<number, { tokens: number; turns: number }>();
   const sessions = new Set<string>();
+  // Resuming or forking a session copies earlier assistant messages verbatim
+  // into the new session's file, so the same message uuid recurs across files.
+  // Dedupe on uuid to avoid counting those repeated turns more than once.
+  const seenUuids = new Set<string>();
 
   let totalTokens = 0;
   let totalInput = 0;
@@ -261,6 +377,11 @@ function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats
 
       const usageData = entry.message?.usage || entry.usage;
       if (!entry.timestamp || !usageData) continue;
+
+      if (entry.uuid) {
+        if (seenUuids.has(entry.uuid)) continue;
+        seenUuids.add(entry.uuid);
+      }
 
       const model = entry.message?.model || entry.model || "unknown";
       if (model === "<synthetic>") continue;

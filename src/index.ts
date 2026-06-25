@@ -31,6 +31,11 @@ function parseArgs(): CliOptions {
       case "--json":
         options.json = true;
         break;
+      case "--color":
+      case "--no-color":
+        // Color is resolved at module load in src/color.ts (it reads
+        // process.argv directly); listed here only so they're accepted options.
+        break;
       case "--verbose":
       case "-v":
         options.verbose = true;
@@ -114,6 +119,8 @@ OPTIONS
   --model <name>     Filter to a specific model (substring match, e.g. gpt-4o)
   --by <dimension>   Breakdown: model, project, hour
   --json             Output raw JSON
+  --color, --no-color
+                     Force or disable ANSI color (default: auto-detect; also honors NO_COLOR / FORCE_COLOR)
   -v, --verbose      Show path detection debug info
   --db <path>        Override OpenCode DB path
   --claude <path>    Override Claude data path (stats-cache file or projects dir)

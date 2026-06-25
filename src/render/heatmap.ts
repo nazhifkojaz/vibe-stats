@@ -1,5 +1,5 @@
 import type { DailyActivity, AgentStats } from "../types";
-import { ANSI_RESET, ANSI_DIM, ANSI_BOLD, formatTokens, formatDateLocal, HARNESS_PALETTES, DEFAULT_PALETTE } from "./format";
+import { ANSI_RESET, ANSI_DIM, ANSI_BOLD, EMPTY_COLOR, formatTokens, formatDateLocal, HARNESS_PALETTES, DEFAULT_PALETTE } from "./format";
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_LABELS = [
@@ -7,7 +7,6 @@ const MONTH_LABELS = [
   "July", "August", "September", "October", "November", "December",
 ];
 
-const EMPTY_COLOR = "\x1b[38;5;240m";
 const BLOCK = "\u25A0";
 
 const LABEL_WIDTH = 4;
@@ -45,10 +44,15 @@ function dateToGrid(weeks: number): { startDate: Date; endDate: Date; grid: (Dai
   }
 
   const d = new Date(startDate);
+  let dayIndex = 0;
   while (d <= endDate) {
     const dow = d.getDay();
-    const diffMs = d.getTime() - startDate.getTime();
-    const weekIdx = Math.floor(diffMs / (7 * 86400000));
+    // Count calendar days from the (Sunday-aligned) start instead of dividing
+    // elapsed ms by a 7-day span. Across a DST transition a local week is not
+    // exactly 7 * 86400000 ms, so the ms-based index bucketed days near the
+    // change into the wrong column (e.g. dropping a month header under
+    // America/Los_Angeles around the March spring-forward).
+    const weekIdx = Math.floor(dayIndex / 7);
     if (weekIdx >= 0 && weekIdx < weeks) {
       grid[dow][weekIdx] = {
         date: formatDateLocal(d),
@@ -58,6 +62,7 @@ function dateToGrid(weeks: number): { startDate: Date; endDate: Date; grid: (Dai
       };
     }
     d.setDate(d.getDate() + 1);
+    dayIndex++;
   }
 
   return { startDate, endDate, grid };
@@ -75,9 +80,13 @@ function renderMonthHeader(grid: (DailyActivity | null)[][], weeks: number): str
     for (let dow = 0; dow < 7; dow++) {
       const cell = grid[dow]?.[w];
       if (cell) {
-        const d = new Date(cell.date);
-        if (d.getDate() === 1) {
-          monthOfFirstDay = d.getMonth();
+        // Parse the date string in local terms via parseDateParts. Using
+        // `new Date(cell.date).getDate()` would parse "YYYY-MM-DD" as UTC
+        // midnight, so in any negative-UTC-offset timezone the 1st reads as the
+        // prior day and the month label lands in the wrong column.
+        const p = parseDateParts(cell.date);
+        if (p.day === 1) {
+          monthOfFirstDay = p.month;
           break;
         }
       }

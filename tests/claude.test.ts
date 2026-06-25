@@ -188,6 +188,166 @@ function writeStaleCacheWithJsonlFixture(): { root: string; cacheDir: string } {
   return { root, cacheDir: root };
 }
 
+function writeDisjointCacheAndJsonlFixture(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-disjoint-"));
+  tempDirs.push(root);
+
+  // Live JSONL transcripts cover the recent dates Claude still keeps on disk.
+  const projectDir = path.join(root, "projects", "-home-alice-app");
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(path.join(projectDir, "session.jsonl"), [
+    JSON.stringify({
+      type: "assistant",
+      timestamp: "2026-06-01T10:00:00",
+      cwd: "/home/alice/app",
+      sessionId: "session-A",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4",
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      timestamp: "2026-06-02T11:00:00",
+      cwd: "/home/alice/app",
+      sessionId: "session-B",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4",
+        usage: { input_tokens: 2000, output_tokens: 1000 },
+      },
+    }),
+  ].join("\n"));
+
+  // Frozen cache retains older history that Claude has since pruned from disk.
+  writeFileSync(path.join(root, "stats-cache.json"), JSON.stringify({
+    version: 3,
+    lastComputedDate: "2026-05-31",
+    dailyActivity: [
+      { date: "2026-05-30", messageCount: 4, sessionCount: 1, toolCallCount: 0 },
+      { date: "2026-05-31", messageCount: 6, sessionCount: 2, toolCallCount: 0 },
+    ],
+    dailyModelTokens: [
+      { date: "2026-05-30", tokensByModel: { "claude-opus": 1000 } },
+      { date: "2026-05-31", tokensByModel: { "claude-opus": 2000 } },
+    ],
+    modelUsage: {
+      "claude-opus": {
+        inputTokens: 1800,
+        outputTokens: 600,
+        cacheReadInputTokens: 400,
+        cacheCreationInputTokens: 200,
+        costUSD: 5,
+      },
+    },
+    totalSessions: 3,
+    totalMessages: 10,
+    hourCounts: { "8": 4, "9": 6 },
+    firstSessionDate: "2026-05-30",
+  }));
+
+  return root;
+}
+
+function writeDuplicateUuidFixture(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-dupuuid-"));
+  tempDirs.push(root);
+
+  const projectDir = path.join(root, "projects", "-home-alice-app");
+  mkdirSync(projectDir, { recursive: true });
+
+  // The same assistant message (uuid msg-1) appears in both an original session
+  // file and a resumed/forked one — exactly how Claude Code copies transcripts.
+  const sharedMessage = {
+    type: "assistant",
+    uuid: "msg-1",
+    timestamp: "2026-06-01T10:00:00",
+    cwd: "/home/alice/app",
+    sessionId: "session-1",
+    message: {
+      role: "assistant",
+      model: "claude-opus-4-8",
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 1000 },
+    },
+  };
+  const uniqueMessage = {
+    type: "assistant",
+    uuid: "msg-2",
+    timestamp: "2026-06-01T11:00:00",
+    cwd: "/home/alice/app",
+    sessionId: "session-2",
+    message: {
+      role: "assistant",
+      model: "claude-opus-4-8",
+      usage: { input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 2000 },
+    },
+  };
+
+  writeFileSync(path.join(projectDir, "session-1.jsonl"), JSON.stringify(sharedMessage));
+  writeFileSync(
+    path.join(projectDir, "session-2.jsonl"),
+    [JSON.stringify(sharedMessage), JSON.stringify(uniqueMessage)].join("\n")
+  );
+
+  return path.join(root, "projects");
+}
+
+function writeOverlapCacheAndJsonlFixture(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-overlap-"));
+  tempDirs.push(root);
+
+  // Live JSONL covers 2026-06-01 — a date the frozen cache also still claims.
+  // This is the overlap case: the disjoint fixture exercises cacheFraction = 1,
+  // this one forces cacheFraction < 1 so the model/cost scaling actually runs.
+  const projectDir = path.join(root, "projects", "-home-alice-app");
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(path.join(projectDir, "session.jsonl"), JSON.stringify({
+    type: "assistant",
+    timestamp: "2026-06-01T10:00:00",
+    cwd: "/home/alice/app",
+    sessionId: "session-X",
+    message: {
+      role: "assistant",
+      model: "claude-sonnet-4",
+      usage: { input_tokens: 800, output_tokens: 200 },
+    },
+  }));
+
+  // Frozen cache: three dates of opus, one of which (06-01) overlaps the JSONL.
+  // dailyModelTokens sum (3000) == modelUsage token total (3000), so the cache's
+  // internal scaleFactor stays 1 and the numbers here reach mergeClaudeStats as-is.
+  writeFileSync(path.join(root, "stats-cache.json"), JSON.stringify({
+    version: 3,
+    lastComputedDate: "2026-06-01",
+    dailyActivity: [
+      { date: "2026-05-30", messageCount: 2, sessionCount: 1, toolCallCount: 0 },
+      { date: "2026-05-31", messageCount: 3, sessionCount: 1, toolCallCount: 0 },
+      { date: "2026-06-01", messageCount: 4, sessionCount: 2, toolCallCount: 0 },
+    ],
+    dailyModelTokens: [
+      { date: "2026-05-30", tokensByModel: { "claude-opus": 1000 } },
+      { date: "2026-05-31", tokensByModel: { "claude-opus": 1000 } },
+      { date: "2026-06-01", tokensByModel: { "claude-opus": 1000 } },
+    ],
+    modelUsage: {
+      "claude-opus": {
+        inputTokens: 1500,
+        outputTokens: 1000,
+        cacheReadInputTokens: 300,
+        cacheCreationInputTokens: 200,
+        costUSD: 6,
+      },
+    },
+    totalSessions: 6,
+    totalMessages: 9,
+    hourCounts: { "9": 4, "14": 5 },
+    firstSessionDate: "2026-05-30",
+  }));
+
+  return root;
+}
+
 function writeEmptyCacheWithJsonlFixture(): string {
   const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-empty-cache-"));
   tempDirs.push(root);
@@ -398,6 +558,87 @@ describe("claude.parse", () => {
     expect(stats).not.toBeNull();
     expect(stats!.totalTokens).toBe(4500);
     expect(stats!.dailyActivity).toHaveLength(2);
+    expect(stats!.totalTurns).toBe(2);
+  });
+
+  it("merges older stats-cache history with newer JSONL by date", () => {
+    const root = writeDisjointCacheAndJsonlFixture();
+    const stats = parse(root);
+
+    expect(stats).not.toBeNull();
+    // Recent JSONL dates and pruned cache-only dates both survive.
+    expect(stats!.dailyActivity).toEqual([
+      { date: "2026-05-30", tokens: 1000, turns: 4, cost: 0 },
+      { date: "2026-05-31", tokens: 2000, turns: 6, cost: 0 },
+      { date: "2026-06-01", tokens: 1500, turns: 1, cost: 0 },
+      { date: "2026-06-02", tokens: 3000, turns: 1, cost: 0 },
+    ]);
+    expect(stats!.activeDays).toBe(4);
+    expect(stats!.totalTokens).toBe(7500);
+    expect(stats!.totalInputTokens).toBe(4800);
+    expect(stats!.totalOutputTokens).toBe(2100);
+    expect(stats!.totalCacheTokens).toBe(600);
+    expect(stats!.totalCost).toBeCloseTo(5);
+    expect(stats!.totalTurns).toBe(12);
+    expect(stats!.totalSessions).toBe(5);
+    expect(stats!.bestDay).toEqual({ date: "2026-06-02", tokens: 3000 });
+    expect(stats!.modelActivity).toEqual([
+      { model: "claude-sonnet-4", harness: "claude", tokens: 4500, inputTokens: 3000, outputTokens: 1500, cacheTokens: 0, cost: 0 },
+      { model: "claude-opus", harness: "claude", tokens: 3000, inputTokens: 1800, outputTokens: 600, cacheTokens: 600, cost: 5 },
+    ]);
+  });
+
+  it("drops cache tokens for dates JSONL also covers, and scales cache aggregates by the kept share", () => {
+    const root = writeOverlapCacheAndJsonlFixture();
+    const stats = parse(root);
+
+    expect(stats).not.toBeNull();
+    // JSONL owns 2026-06-01, so the cache's 1000 opus tokens for that date drop
+    // out entirely (not added on top of JSONL). The two surviving cache dates hold
+    // 2000 of the cache's 3000 daily tokens, so cacheFraction = 2/3.
+    expect(stats!.dailyActivity).toEqual([
+      { date: "2026-05-30", tokens: 1000, turns: 2, cost: 0 },
+      { date: "2026-05-31", tokens: 1000, turns: 3, cost: 0 },
+      { date: "2026-06-01", tokens: 1000, turns: 1, cost: 0 }, // JSONL only
+    ]);
+    expect(stats!.activeDays).toBe(3);
+    // All three days tie at 1000 tokens; the reducer keeps the first (earliest date).
+    expect(stats!.bestDay).toEqual({ date: "2026-05-30", tokens: 1000 });
+
+    // claude-opus: the cache's lifetime aggregates scaled by 2/3. The cache carries
+    // no per-date model breakdown, so this is a global-share approximation, not an
+    // exact per-model-by-date computation. tokens/input/cost land clean; output/cache
+    // hit the Math.round path (1000*2/3=666.67->667, 500*2/3=333.33->333). cost is the
+    // one field left unrounded through the merge (6*2/3=4 exactly here).
+    // claude-sonnet-4: full JSONL values, unscaled. Sorted by tokens desc.
+    expect(stats!.modelActivity).toEqual([
+      { model: "claude-opus", harness: "claude", tokens: 2000, inputTokens: 1000, outputTokens: 667, cacheTokens: 333, cost: 4 },
+      { model: "claude-sonnet-4", harness: "claude", tokens: 1000, inputTokens: 800, outputTokens: 200, cacheTokens: 0, cost: 0 },
+    ]);
+
+    // Header totals derive from the rounded modelActivity sums, so they always match
+    // `--by model` exactly.
+    expect(stats!.totalTokens).toBe(3000);
+    expect(stats!.totalInputTokens).toBe(1800);
+    expect(stats!.totalOutputTokens).toBe(867);
+    expect(stats!.totalCacheTokens).toBe(333);
+    expect(stats!.totalCost).toBe(4);
+
+    // Turns are exact: JSONL turns (1) + the cache's surviving per-date turns (2+3).
+    // Sessions scale like the model totals: JSONL (1) + round(cacheSessions * 2/3) = round(6*2/3) = 4.
+    expect(stats!.totalTurns).toBe(6);
+    expect(stats!.totalSessions).toBe(5);
+  });
+
+  it("counts a duplicated message uuid once across resumed session files", () => {
+    const stats = parse(writeDuplicateUuidFixture());
+
+    expect(stats).not.toBeNull();
+    // msg-1 (1150 tokens) appears twice but counts once; msg-2 adds 2300.
+    expect(stats!.totalTokens).toBe(3450);
+    expect(stats!.totalInputTokens).toBe(300);
+    expect(stats!.totalOutputTokens).toBe(150);
+    expect(stats!.totalCacheTokens).toBe(3000);
     expect(stats!.totalTurns).toBe(2);
   });
 

@@ -88,6 +88,15 @@ export function renderByProject(agents: AgentStats[], termWidth: number = 120): 
     lines.push(`  ${ANSI_DIM}Note: ${noProjectAgents.join(", ")} ${noProjectAgents.length === 1 ? "does" : "do"} not report per-project data, so totals may be lower than actual usage.${ANSI_RESET}`);
   }
 
+  // Claude Code stores per-project data only in raw session transcripts, which
+  // it auto-deletes past cleanupPeriodDays (default 30). Older usage survives
+  // only as a project-less aggregate, so Claude's project totals are recent-only.
+  const claudeHasProjects = agents.some(a => a.harness === "claude" && a.projectActivity.length > 0);
+  if (claudeHasProjects) {
+    lines.push("");
+    lines.push(`  ${ANSI_DIM}Note: claude code per-project totals cover only transcripts still on disk; Claude Code auto-deletes older sessions (default ~30 days — raise cleanupPeriodDays to keep more).${ANSI_RESET}`);
+  }
+
   return lines.join("\n");
 }
 
