@@ -22,7 +22,11 @@ vibe-o-meter --by project
 vibe-o-meter --by hour
 vibe-o-meter --weeks 8 --json
 vibe-o-meter --verbose
+vibe-o-meter --color | less -R
+vibe-o-meter --no-color > report.txt
 ```
+
+Color is auto-enabled on an interactive terminal and auto-disabled when piped or redirected. `NO_COLOR` and `FORCE_COLOR` are honored; `--color` / `--no-color` override both.
 
 `--weeks` controls the calendar-week heatmap range and the summary totals rendered with it. `--week` is accepted as an alias. Range-filtered JSON clears aggregate fields that cannot be accurately narrowed to the selected dates instead of showing stale all-time breakdowns.
 
