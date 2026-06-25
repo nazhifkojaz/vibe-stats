@@ -2,6 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { createRequire } from "module";
+import { detectColorEnabled } from "./color";
 
 const CURRENT_VERSION = getLocalVersion();
 const CACHE_FILE = path.join(os.homedir(), ".cache", "vibe-o-meter", "update-check.json");
@@ -122,9 +123,16 @@ function numericIdentifier(value: string): number | null {
 }
 
 function printWarning(latest: string): void {
+  // Don't nag non-interactive consumers (pipes, redirects, `--json` users) with
+  // escape-code soup on stderr; only warn on an interactive terminal.
+  if (!process.stderr.isTTY) return;
+  const color = detectColorEnabled(process.argv, process.env, process.stderr);
+  const yellow = color ? "[33m" : "";
+  const bold = color ? "[1m" : "";
+  const reset = color ? "[0m" : "";
   console.error(
-    `\n\u001B[33mWarning:\u001B[0m You're running vibe-o-meter@${CURRENT_VERSION}, but \u001B[1m${latest}\u001B[0m is available.\n` +
-    `Run \u001B[1mnpx vibe-o-meter@latest\u001B[0m to update.`
+    `\n${yellow}Warning:${reset} You're running vibe-o-meter@${CURRENT_VERSION}, but ${bold}${latest}${reset} is available.\n` +
+    `Run ${bold}npx vibe-o-meter@latest${reset} to update.`
   );
 }
 

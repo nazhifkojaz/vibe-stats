@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { isNewerVersion } from "../src/update-check";
 
 const ORIGINAL_HOME = process.env.HOME;
+const ORIGINAL_STDERR_ISTTY = process.stderr.isTTY;
 const tempDirs: string[] = [];
 const PACKAGE_VERSION = JSON.parse(readFileSync(path.join(process.cwd(), "package.json"), "utf8")).version as string;
 
@@ -13,6 +14,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
   restoreHome();
+  Object.defineProperty(process.stderr, "isTTY", { value: ORIGINAL_STDERR_ISTTY, configurable: true, writable: true });
 
   while (tempDirs.length > 0) {
     rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -96,6 +98,8 @@ describe("checkForUpdate", () => {
     const home = makeHome();
     const newerVersion = nextPatchVersion();
     writeUpdateCache(home, newerVersion);
+    // printWarning now only fires on an interactive stderr.
+    Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true, writable: true });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal("fetch", vi.fn());
 
