@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-25
+
+### Fixed
+
+- **Claude Code: assistant token usage is now deduplicated by API response id
+  (`message.id`), fixing a ~2.5× over-count.** Claude Code writes a single API
+  response as several JSONL lines — streaming snapshots and one row per content
+  block, plus verbatim copies when a session is resumed or forked — and each line
+  repeats the same `usage`. Summing every line inflated Claude token and turn
+  counts roughly 2–3×. The parser now collapses all lines sharing a `message.id`
+  into one response (keeping the completed line), superseding the prior
+  uuid-only dedup (uuid is now a fallback key). **Recent Claude token totals will
+  drop accordingly — the lower numbers are the correct ones.**
+
 ## [0.2.0] - 2026-06-25
 
 ### Added

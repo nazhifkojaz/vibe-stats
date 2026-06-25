@@ -51,6 +51,7 @@ interface ClaudeProjectLine {
   model?: string;
   usage?: Record<string, unknown>;
   message?: {
+    id?: string;
     role?: string;
     model?: string;
     usage?: Record<string, unknown>;
@@ -333,29 +334,25 @@ function parseStatsCache(filePath: string, modelFilter?: string): AgentStats | n
   }
 }
 
-function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats | null {
-  const files = collectJsonlFiles(projectsDir);
-  if (files.length === 0) return null;
+interface DedupedEntry {
+  date: string;
+  hour: number;
+  project: string;
+  model: string;
+  sessionKey: string;
+  usage: ReturnType<typeof readUsage>;
+}
 
-  const needle = modelFilter?.toLowerCase();
-  const dailyMap = new Map<string, { tokens: number; turns: number; cost: number }>();
-  const modelMap = new Map<string, { tokens: number; input: number; output: number; cache: number; cost: number }>();
-  const projectMap = new Map<string, number>();
-  const hourlyMap = new Map<number, { tokens: number; turns: number }>();
-  const sessions = new Set<string>();
-  // Resuming or forking a session copies earlier assistant messages verbatim
-  // into the new session's file, so the same message uuid recurs across files.
-  // Dedupe on uuid to avoid counting those repeated turns more than once.
-  const seenUuids = new Set<string>();
-
-  let totalTokens = 0;
-  let totalInput = 0;
-  let totalOutput = 0;
-  let totalCache = 0;
-  let totalTurns = 0;
+// Walk every JSONL line and return one entry per unique API response. Lines that
+// share a message.id (streaming deltas, per-content-block rows, or resumed-session
+// copies) collapse to a single entry — the one with the most output tokens, i.e.
+// the completed message rather than a mid-stream snapshot. Lines without a
+// message.id fall back to uuid, then to a per-line key so they are never merged.
+function collectDedupedEntries(files: string[], projectsDir: string, needle?: string): DedupedEntry[] {
+  const seen = new Map<string, DedupedEntry>();
+  let lineCounter = 0;
 
   for (const file of files) {
-    let fileMatched = false;
     const fallbackProject = projectNameFromFile(projectsDir, file);
 
     let lines: string[];
@@ -378,11 +375,6 @@ function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats
       const usageData = entry.message?.usage || entry.usage;
       if (!entry.timestamp || !usageData) continue;
 
-      if (entry.uuid) {
-        if (seenUuids.has(entry.uuid)) continue;
-        seenUuids.add(entry.uuid);
-      }
-
       const model = entry.message?.model || entry.model || "unknown";
       if (model === "<synthetic>") continue;
       if (needle && !model.toLowerCase().includes(needle)) continue;
@@ -390,46 +382,78 @@ function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats
       const usage = readUsage(usageData);
       if (usage.tokens === 0) continue;
 
-      const date = formatDateLocal(new Date(entry.timestamp));
-      const hour = new Date(entry.timestamp).getHours();
-      const project = normalizeProject(entry.cwd || fallbackProject);
+      const key = entry.message?.id || entry.uuid || `__line_${lineCounter++}`;
+      const existing = seen.get(key);
+      if (existing && existing.usage.outputTokens >= usage.outputTokens) continue;
 
-      const daily = dailyMap.get(date) || { tokens: 0, turns: 0, cost: 0 };
-      daily.tokens += usage.tokens;
-      daily.turns += 1;
-      dailyMap.set(date, daily);
-
-      const modelEntry = modelMap.get(model) || { tokens: 0, input: 0, output: 0, cache: 0, cost: 0 };
-      modelEntry.tokens += usage.tokens;
-      modelEntry.input += usage.inputTokens;
-      modelEntry.output += usage.outputTokens;
-      modelEntry.cache += usage.cacheTokens;
-      modelMap.set(model, modelEntry);
-
-      projectMap.set(project, (projectMap.get(project) || 0) + usage.tokens);
-
-      const hourly = hourlyMap.get(hour) || { tokens: 0, turns: 0 };
-      hourly.tokens += usage.tokens;
-      hourly.turns += 1;
-      hourlyMap.set(hour, hourly);
-
-      totalTokens += usage.tokens;
-      totalInput += usage.inputTokens;
-      totalOutput += usage.outputTokens;
-      totalCache += usage.cacheTokens;
-      totalTurns += 1;
-      fileMatched = true;
-
-      const sessionId = entry.sessionId || entry.session_id;
-      if (sessionId) sessions.add(sessionId);
-    }
-
-    if (fileMatched && sessions.size === 0) {
-      sessions.add(file);
+      const timestamp = new Date(entry.timestamp);
+      seen.set(key, {
+        date: formatDateLocal(timestamp),
+        hour: timestamp.getHours(),
+        project: normalizeProject(entry.cwd || fallbackProject),
+        model,
+        sessionKey: entry.sessionId || entry.session_id || file,
+        usage,
+      });
     }
   }
 
-  if (totalTokens === 0) return null;
+  return Array.from(seen.values());
+}
+
+function parseProjectLogs(projectsDir: string, modelFilter?: string): AgentStats | null {
+  const files = collectJsonlFiles(projectsDir);
+  if (files.length === 0) return null;
+
+  const needle = modelFilter?.toLowerCase();
+
+  // Claude Code writes one API response as several JSONL lines (streaming
+  // deltas / per-content-block, plus verbatim copies when a session is resumed
+  // or forked). Each line repeats the SAME usage, so summing every line
+  // over-counts by ~2-3x. Deduplicate on the API response id (message.id),
+  // keeping the most complete line per response.
+  const deduped = collectDedupedEntries(files, projectsDir, needle);
+  if (deduped.length === 0) return null;
+
+  const dailyMap = new Map<string, { tokens: number; turns: number; cost: number }>();
+  const modelMap = new Map<string, { tokens: number; input: number; output: number; cache: number; cost: number }>();
+  const projectMap = new Map<string, number>();
+  const hourlyMap = new Map<number, { tokens: number; turns: number }>();
+  const sessions = new Set<string>();
+
+  let totalTokens = 0;
+  let totalInput = 0;
+  let totalOutput = 0;
+  let totalCache = 0;
+  let totalTurns = 0;
+
+  for (const e of deduped) {
+    const daily = dailyMap.get(e.date) || { tokens: 0, turns: 0, cost: 0 };
+    daily.tokens += e.usage.tokens;
+    daily.turns += 1;
+    dailyMap.set(e.date, daily);
+
+    const modelEntry = modelMap.get(e.model) || { tokens: 0, input: 0, output: 0, cache: 0, cost: 0 };
+    modelEntry.tokens += e.usage.tokens;
+    modelEntry.input += e.usage.inputTokens;
+    modelEntry.output += e.usage.outputTokens;
+    modelEntry.cache += e.usage.cacheTokens;
+    modelMap.set(e.model, modelEntry);
+
+    projectMap.set(e.project, (projectMap.get(e.project) || 0) + e.usage.tokens);
+
+    const hourly = hourlyMap.get(e.hour) || { tokens: 0, turns: 0 };
+    hourly.tokens += e.usage.tokens;
+    hourly.turns += 1;
+    hourlyMap.set(e.hour, hourly);
+
+    totalTokens += e.usage.tokens;
+    totalInput += e.usage.inputTokens;
+    totalOutput += e.usage.outputTokens;
+    totalCache += e.usage.cacheTokens;
+    totalTurns += 1;
+    sessions.add(e.sessionKey);
+  }
 
   const dailyActivity: DailyActivity[] = Array.from(dailyMap.entries())
     .sort(([a], [b]) => a.localeCompare(b))

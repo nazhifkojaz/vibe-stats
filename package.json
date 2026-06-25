@@ -1,6 +1,6 @@
 {
   "name": "vibe-o-meter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Terminal tool to visualize AI coding agent usage across OpenCode, Claude Code, Codex, and Pi",
   "type": "module",
   "main": "dist/index.js",

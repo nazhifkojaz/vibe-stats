@@ -250,6 +250,42 @@ function writeDisjointCacheAndJsonlFixture(): string {
   return root;
 }
 
+function writeStreamingMessageIdFixture(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-msgid-"));
+  tempDirs.push(root);
+  const projectDir = path.join(root, "projects", "-home-alice-app");
+  mkdirSync(projectDir, { recursive: true });
+
+  // One API response (message.id "msg-stream") logged as several JSONL lines,
+  // each repeating the same usage. Two streaming snapshots (output 1) precede
+  // the completed line (output 500); a fourth line is a separate response.
+  const lineFor = (uuid: string, msgId: string, output: number) => JSON.stringify({
+    type: "assistant",
+    uuid,
+    timestamp: "2026-06-23T10:00:00",
+    sessionId: "session-1",
+    message: {
+      id: msgId,
+      role: "assistant",
+      model: "claude-opus-4-8",
+      usage: { input_tokens: 100, output_tokens: output, cache_read_input_tokens: 5000 },
+    },
+  });
+
+  writeFileSync(path.join(projectDir, "session.jsonl"), [
+    lineFor("u1", "msg-stream", 1),
+    lineFor("u2", "msg-stream", 1),
+    lineFor("u3", "msg-stream", 500),
+    lineFor("u4", "msg-second", 200),
+  ].join("\n"));
+
+  // A resumed session copies the completed msg-stream line into a second file
+  // (new uuid, same message.id) — it must still collapse to the one response.
+  writeFileSync(path.join(projectDir, "resumed.jsonl"), lineFor("u5", "msg-stream", 500));
+
+  return path.join(root, "projects");
+}
+
 function writeDuplicateUuidFixture(): string {
   const root = mkdtempSync(path.join(tmpdir(), "vibe-o-meter-claude-dupuuid-"));
   tempDirs.push(root);
@@ -628,6 +664,23 @@ describe("claude.parse", () => {
     // Sessions scale like the model totals: JSONL (1) + round(cacheSessions * 2/3) = round(6*2/3) = 4.
     expect(stats!.totalTurns).toBe(6);
     expect(stats!.totalSessions).toBe(5);
+  });
+
+  it("collapses multiple JSONL lines sharing one message.id into a single response", () => {
+    const stats = parse(writeStreamingMessageIdFixture());
+
+    expect(stats).not.toBeNull();
+    // msg-stream counts once with the COMPLETED line (output 500), not summed
+    // across its three lines: 100 + 500 + 5000 = 5600 — and the cross-file
+    // resume copy of it does not add again. msg-second: 100 + 200 + 5000 = 5300.
+    // Total 10900 — the raw 5-line sum would be 26203.
+    expect(stats!.totalTokens).toBe(10900);
+    expect(stats!.totalOutputTokens).toBe(700);
+    expect(stats!.totalInputTokens).toBe(200);
+    expect(stats!.totalCacheTokens).toBe(10000);
+    expect(stats!.totalTurns).toBe(2);
+    // All lines share one sessionId, so dedup must not inflate the session count.
+    expect(stats!.totalSessions).toBe(1);
   });
 
   it("counts a duplicated message uuid once across resumed session files", () => {
